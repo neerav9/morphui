@@ -1,279 +1,130 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { motion, AnimatePresence, useMotionValue, useSpring } from "framer-motion";
-import Papa from "papaparse";
-import { z } from "zod";
 import {
-  LogStage, LogLevel, LogEntry,
-  AgenticState, UIPrimitive, UILayout, UINode, Severity, SemanticRole, OperationalDomain, CleanedColumn,
-  WorkflowArchetype, Workflow, HeroInsight, GlobalDashboard, InteractionMemory,
-  LLMFailureReason, SynthesisState, LLMAttemptResult, PromptLevel, ModelTier,
-  AdvancedMetrics, CausalRelation, ColumnProfile
-} from "./types";
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+} from "react";
+
+import {
+  motion,
+  AnimatePresence,
+} from "framer-motion";
+
+import Papa from "papaparse";
 
 // ============================================================
-// GLOBAL CONFIG
+// TYPES
 // ============================================================
 
-const LLM_CONFIG = {
-  endpoint: "http://localhost:11434/api/generate",
-  defaultModel: "mistral",
-  timeouts: {
-    full: 90_000,
-    compressed: 60_000,
-    minimal: 45_000,
-  },
-} as const;
+import type {
+  GlobalDashboard,
+  InteractionMemory,
+  SynthesisState,
+  ColumnProfile,
+  CausalRelation,
+} from "./types/index";
+
+// ============================================================
+// ANALYTICS
+// ============================================================
+
+import {
+  calculateCausalRelations,
+} from "./analytics/correlations";
+
+import {
+  profileDataset,
+} from "./analytics/profiling";
+
+// ============================================================
+// LLM
+// ============================================================
+
+import {
+  generateAgenticDashboard,
+} from "./llm/mistral";
+
+import {
+  AVAILABLE_MODELS,
+  getModelTier,
+} from "./llm/modelTier";
+
+import {
+  LLM_CONFIG,
+} from "./llm/config";
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+
+import {
+  generateFallbackDashboard,
+  FALLBACK_REASON_LABELS,
+} from "./dashboard/fallbackGenerator";
+
+// ============================================================
+// UI
+// ============================================================
+
+import UIRecursiveRenderer
+  from "./ui/renderers/UIRecursiveRenderer";
+
+import ParticleField
+  from "./ui/animations/ParticleField";
+
+import CursorGlow
+  from "./ui/animations/CursorGlow";
+
+import MorphLogo
+  from "./ui/layouts/MorphLogo";
+
+import LoadingPhases
+  from "./ui/panels/LoadingPhases";
+
+import {
+  severityColors,
+} from "./ui/constants/severityColors";
+
+// ============================================================
+// UTILS
+// ============================================================
+
+import {
+  emit,
+} from "./utils/logger";
+
+import type {
+  CleanedColumn,
+  SemanticRole,
+  OperationalDomain,
+} from "./types/index";
+
 
 // ============================================================
 // OBSERVABILITY LOGGER
 // ============================================================
 
-function emit(entry: LogEntry) {
-  const icons: Record<LogLevel, string> = { info: "🔵", warn: "🟡", error: "🔴", success: "🟢" };
-  const label = `${icons[entry.level]} [MorphUI:${entry.stage}]`;
-  if (entry.data !== undefined) {
-    console.groupCollapsed(`${label} ${entry.message}`);
-    console.log(entry.data);
-    console.groupEnd();
-  } else {
-    console.log(`${label} ${entry.message}`);
-  }
-}
 
 // ============================================================
 // ADVANCED DETERMINISTIC ANALYTICS ENGINE
 // ============================================================
 
-function calculateShannonEntropy(values: number[]): number {
-  if (values.length === 0) return 0;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min;
-  if (range === 0) return 0;
-  
-  const binCount = 10;
-  const bins = new Array(binCount).fill(0);
-  for (const v of values) {
-    let binIdx = Math.floor(((v - min) / range) * binCount);
-    if (binIdx >= binCount) binIdx = binCount - 1;
-    if (binIdx < 0) binIdx = 0;
-    bins[binIdx]++;
-  }
-  
-  let entropy = 0;
-  const n = values.length;
-  for (const count of bins) {
-    if (count > 0) {
-      const p = count / n;
-      entropy -= p * Math.log2(p);
-    }
-  }
-  return parseFloat(entropy.toFixed(3));
-}
 
-function calculateAdvancedNumericMetrics(values: number[]): AdvancedMetrics {
-  const n = values.length;
-  if (n === 0) {
-    return { mean:0, variance:0, stdDev:0, min:0, max:0, percentiles:{p25:0, p50:0, p75:0, p90:0}, zScoreOutliers:[], entropy:0, rollingVolatility:[], regimeShiftDetected:false, skewness:0, nullRatio:1 };
-  }
-  
-  const sorted = [...values].sort((a,b) => a - b);
-  const mean = values.reduce((sum, v) => sum + v, 0) / n;
-  const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / n;
-  const stdDev = Math.sqrt(variance);
-  
-  const getPercentile = (p: number) => {
-    const idx = Math.floor((n - 1) * p);
-    return sorted[idx] ?? 0;
-  };
-  
-  const zScoreOutliers: number[] = [];
-  if (stdDev > 0) {
-    for (let i = 0; i < values.length; i++) {
-      const z = Math.abs((values[i] - mean) / stdDev);
-      if (z > 2.5) zScoreOutliers.push(i);
-    }
-  }
 
-  let skewness = 0;
-  if (n > 2 && stdDev > 0) {
-    const m3 = values.reduce((sum, v) => sum + Math.pow(v - mean, 3), 0) / n;
-    skewness = m3 / Math.pow(stdDev, 3);
-  }
 
-  const rollingVolatility: number[] = [];
-  const windowSize = 5;
-  for (let i = 0; i <= values.length - windowSize; i++) {
-    const subset = values.slice(i, i + windowSize);
-    const subMean = subset.reduce((a,b)=>a+b,0) / windowSize;
-    const subVar = subset.reduce((a,b)=>a+Math.pow(b-subMean,2),0) / windowSize;
-    rollingVolatility.push(parseFloat(Math.sqrt(subVar).toFixed(3)));
-  }
-
-  let regimeShiftDetected = false;
-  if (n >= 10) {
-    const midPoint = Math.floor(n / 2);
-    const firstHalf = values.slice(0, midPoint);
-    const secondHalf = values.slice(midPoint);
-    const fhMean = firstHalf.reduce((a,b)=>a+b,0) / firstHalf.length;
-    const shMean = secondHalf.reduce((a,b)=>a+b,0) / secondHalf.length;
-    const difference = Math.abs(fhMean - shMean);
-    if (stdDev > 0 && difference > (1.5 * stdDev)) {
-      regimeShiftDetected = true;
-    }
-  }
-
-  return {
-    mean: parseFloat(mean.toFixed(3)),
-    variance: parseFloat(variance.toFixed(3)),
-    stdDev: parseFloat(stdDev.toFixed(3)),
-    min: sorted[0],
-    max: sorted[n-1],
-    percentiles: {
-      p25: getPercentile(0.25),
-      p50: getPercentile(0.50),
-      p75: getPercentile(0.75),
-      p90: getPercentile(0.90)
-    },
-    zScoreOutliers,
-    entropy: calculateShannonEntropy(values),
-    rollingVolatility,
-    regimeShiftDetected,
-    skewness: parseFloat(skewness.toFixed(3)),
-    nullRatio: 0
-  };
-}
 
 // ============================================================
 // COVARIANCE MATRIX & MUTUAL CAUSAL ANALYSIS
 // ============================================================
 
-function calculateCausalRelations(profiles: ColumnProfile[], rawData: Record<string, unknown>[]): CausalRelation[] {
-  const relations: CausalRelation[] = [];
-  const numericProfiles = profiles.filter(p => p.inferredType === "numeric");
-  const MAX_COMPARE_SAMPLES = 1000;
-  const samples = rawData.slice(0, MAX_COMPARE_SAMPLES);
 
-  for (let i = 0; i < numericProfiles.length; i++) {
-    for (let j = i + 1; j < numericProfiles.length; j++) {
-      const colA = numericProfiles[i];
-      const colB = numericProfiles[j];
-
-      const x: number[] = [];
-      const y: number[] = [];
-
-      for (const row of samples) {
-        // Safe mapping using verified raw CSV keys
-        const valA = Number(row[colA.rawKey]); 
-        const valB = Number(row[colB.rawKey]);
-        if (!isNaN(valA) && !isNaN(valB)) {
-          x.push(valA);
-          y.push(valB);
-        }
-      }
-
-      const len = x.length;
-      if (len < 5) continue;
-
-      const meanX = x.reduce((a, b) => a + b, 0) / len;
-      const meanY = y.reduce((a, b) => a + b, 0) / len;
-
-      let covarianceSum = 0;
-      let varXSum = 0;
-      let varYSum = 0;
-
-      for (let k = 0; k < len; k++) {
-        const diffX = x[k] - meanX;
-        const diffY = y[k] - meanY;
-        covarianceSum += diffX * diffY;
-        varXSum += diffX * diffX;
-        varYSum += diffY * diffY;
-      }
-
-      const covariance = covarianceSum / len;
-      const denom = Math.sqrt(varXSum * varYSum);
-      const pearsonR = denom === 0 ? 0 : covarianceSum / denom;
-
-      let direction: CausalRelation["direction"] = "stable_uncoupled";
-      if (pearsonR >= 0.45) direction = "positive_feedback";
-      else if (pearsonR <= -0.45) direction = "inverse_coupling";
-
-      if (Math.abs(pearsonR) >= 0.35) {
-        relations.push({
-          source: colA.cleanName,
-          target: colB.cleanName,
-          covariance: parseFloat(covariance.toFixed(3)),
-          pearsonR: parseFloat(pearsonR.toFixed(3)),
-          direction,
-          entropyGap: parseFloat(Math.abs((colA.entropy ?? 0) - (colB.entropy ?? 0)).toFixed(3))
-        });
-      }
-    }
-  }
-
-  return relations.sort((a,b) => Math.abs(b.pearsonR) - Math.abs(a.pearsonR));
-}
 
 // ============================================================
 // ZOD SCHEMAS
 // ============================================================
 
-const ZUIPrimitive = z.enum(["kpi_block","scatter_plot","trend_sparkline","alert_chip","bar_chart","stat_grid","semantic_tags","data_table","insight_cluster"]);
-const ZUILayout = z.enum(["col","row","grid_2"]);
-const ZSeverity = z.enum(["critical","high","medium","low"]);
-const ZGlobalSeverity = z.enum(["critical","elevated","stable"]);
-const ZCognitiveDensity = z.enum(["high","medium","low"]);
-const ZWorkflowArchetype = z.enum(["ANOMALY_WORKFLOW","TEMPORAL_WORKFLOW","CORRELATION_WORKFLOW","DISTRIBUTION_WORKFLOW","CLUSTER_WORKFLOW","BEHAVIORAL_WORKFLOW","OPERATIONAL_WORKFLOW"]);
 
-const ZUINodeBase = z.object({ type: z.union([ZUIPrimitive, ZUILayout]), meta: z.record(z.unknown()).optional() });
-type ZUINodeType = z.infer<typeof ZUINodeBase> & { children?: ZUINodeType[] };
-const ZUINode: z.ZodType<ZUINodeType> = ZUINodeBase.extend({ children: z.lazy(() => ZUINode.array().max(10).optional()) });
-
-const ZAgenticState = z.object({
-  situationalAwareness: z.string().min(1).default("Macro pipeline validation initialized."),
-  layoutStrategy: z.string().min(1).default("Deterministic density grid mapping."),
-  cognitiveDensity: ZCognitiveDensity.default("high"),
-  selfCritique: z.string().min(1).default("All calculated boundaries verified with Pearson R validations.")
-});
-
-const ZHeroInsight = z.object({
-  headline: z.string().default("Integrated System Equilibrium Profiled"),
-  supportingStatement: z.string().default("No extreme anomalies breached standard statistical deviation thresholds."),
-  primaryMetricValue: z.string().default("100%"),
-  metricLabel: z.string().default("Telemetry Density"),
-  causalLink: z.string().default("Primary covariance nodes remain aligned."),
-  affectedVectors: z.array(z.string()).default([]),
-  severity: ZSeverity.default("low")
-});
-
-const ZWorkflow = z.object({
-  title: z.string().min(1).default("Operational Vector"),
-  layoutMode: z.string().default("dashboard"),
-  archetype: ZWorkflowArchetype.default("OPERATIONAL_WORKFLOW"),
-  uiBlueprint: ZUINode.default({ type: "col", children: [{ type: "kpi_block" }] }),
-  primaryMetric: z.string().default("—"),
-  secondaryMetric: z.string().default("—"),
-  severity: ZSeverity.default("medium"),
-  quickStats: z.record(z.string()).default({}),
-  tags: z.array(z.string()).min(1).default(["Telemetry"]),
-  confidence: z.number().min(0).max(100).default(85),
-  description: z.string().default("Telemetry parsing."),
-  reasoning: z.string().default("Derived deterministic bounds profiling."),
-  businessContext: z.string().default("Continuous monitoring threshold mapping."),
-  chartData: z.array(z.number()).default([]),
-  detectedColumns: z.array(z.string()).default([])
-});
-
-const ZLLMPayload = z.object({
-  agenticState: ZAgenticState,
-  dashboard: z.object({
-    globalSummary: z.string().default("State vectors integrated."),
-    globalSeverity: ZGlobalSeverity.default("stable"),
-    dashboardLayoutMode: z.enum(["COMPACT", "INTELLIGENCE_GRID", "TIMELINE_FIRST", "GRAPH_FIRST"]).default("INTELLIGENCE_GRID"),
-    heroInsight: ZHeroInsight,
-    workflows: z.array(ZWorkflow).min(1).max(8)
-  })
-});
 
 // ============================================================
 // ONTOLOGY + PROFILING
@@ -317,593 +168,62 @@ function processColumns(rawHeaders: string[]): CleanedColumn[] {
     });
 }
 
-function profileDataset(columns: CleanedColumn[], data: Record<string, unknown>[]): ColumnProfile[] {
-  const profiles: ColumnProfile[] = [];
-  const MAX_SAMPLES = 2000;
-  let sampleData = data.filter((_,i) => i % Math.max(1,Math.floor(data.length/MAX_SAMPLES)) === 0).slice(0,MAX_SAMPLES);
-  const temporalCol = columns.find(c => c.role === "TEMPORAL");
-  let isChronological = false;
-  if (temporalCol) {
-    const validDates = sampleData.map(r => Date.parse(String(r[temporalCol.rawName]??""))).filter(d => !isNaN(d));
-    if (validDates.length > sampleData.length * 0.5) {
-      sampleData.sort((a,b) => { 
-        const da=Date.parse(String(a[temporalCol.rawName]??"")),db=Date.parse(String(b[temporalCol.rawName]??"")); 
-        return (!isNaN(da)&&!isNaN(db))?da-db:0; 
-      });
-      isChronological = true;
-    }
-  }
-  for (const col of columns) {
-    let nullCount=0, numericCount=0;
-    const values: unknown[] = [], valueFrequencies: Record<string,number> = {};
-    for (const row of sampleData) {
-      const val = row[col.rawName];
-      if (val===undefined||val===null||String(val).trim()==="") { nullCount++; continue; }
-      const strVal = String(val).trim();
-      values.push(val); valueFrequencies[strVal]=(valueFrequencies[strVal]||0)+1;
-      if (!isNaN(Number(val))&&strVal!=="") numericCount++;
-    }
-    const nonNullCount = values.length;
-    const isNumeric = nonNullCount>0 && (numericCount/nonNullCount)>0.8;
-    const profile: ColumnProfile = { 
-      cleanName:col.cleanName, 
-      rawKey:col.rawKey, 
-      inferredType:isNumeric?"numeric":"categorical", 
-      role:col.role, 
-      domain:col.domain, 
-      nullPercent:Math.round((nullCount/sampleData.length)*100), 
-      nullCount,
-      uniquePercent:nonNullCount===0?0:Math.round((Object.keys(valueFrequencies).length/nonNullCount)*100), 
-      rawValues:[] 
-    };
-    if (isNumeric && nonNullCount>0) {
-      const numValues = values.map(v=>Number(v)).filter(v=>!isNaN(v));
-      const advanced = calculateAdvancedNumericMetrics(numValues);
-      
-      profile.avg = advanced.mean.toString();
-      profile.min = advanced.min.toString();
-      profile.max = advanced.max.toString();
-      profile.stdDev = advanced.stdDev.toString();
-      profile.outlierCount = advanced.zScoreOutliers.length;
-      profile.entropy = advanced.entropy;
-      profile.skewness = advanced.skewness;
-      profile.rollingVolatility = advanced.rollingVolatility;
-      profile.regimeShiftDetected = advanced.regimeShiftDetected;
-      profile.rawValues = numValues.slice(0, 30);
-
-      if (numValues.length>=10) {
-        const half=Math.floor(numValues.length/2),avg1=numValues.slice(0,half).reduce((a,b)=>a+b,0)/half,avg2=numValues.slice(half).reduce((a,b)=>a+b,0)/half;
-        if (avg1!==0) { 
-          const shift=((avg2-avg1)/Math.abs(avg1))*100; 
-          if(isChronological) profile.temporalDrift=`${shift>0?"+":""}${shift.toFixed(1)}%`; 
-          else profile.sequentialVolatility=`${shift>0?"+":""}${shift.toFixed(1)}%`; 
-        }
-      }
-    } else {
-      profile.topClusters = Object.keys(valueFrequencies).sort((a,b)=>valueFrequencies[b]-valueFrequencies[a]).slice(0,4).map(v=>`${v} (${Math.round((valueFrequencies[v]/nonNullCount)*100)}%)`);
-      profile.entropy = calculateShannonEntropy(values.map(v => typeof v === 'number' ? v : 1));
-    }
-    profiles.push(profile);
-  }
-  return profiles;
-}
 
 // ============================================================
 // MODEL CAPABILITY MAP
 // ============================================================
 
-const MODEL_TIERS: Record<string, ModelTier> = {
-  "mistral":"standard","mistral:7b":"standard","llama3":"standard","llama3:8b":"standard",
-  "phi3":"standard","gemma":"standard","gemma:7b":"standard",
-  "qwen2":"advanced","deepseek-coder":"advanced","mixtral":"advanced","llama3:70b":"advanced","llama3.1":"advanced",
-};
-
-function getModelTier(model: string): ModelTier {
-  const normalized = model.toLowerCase();
-  for (const [key, tier] of Object.entries(MODEL_TIERS)) { if(normalized.includes(key)) return tier; }
-  return "standard";
-}
-
-const AVAILABLE_MODELS = [
-  { value:"mistral", label:"mistral", tier:"standard" as ModelTier },
-  { value:"phi3", label:"phi3 (fast)", tier:"standard" as ModelTier },
-  { value:"llama3", label:"llama3", tier:"standard" as ModelTier },
-  { value:"gemma", label:"gemma", tier:"standard" as ModelTier },
-  { value:"mixtral", label:"mixtral (advanced)", tier:"advanced" as ModelTier },
-  { value:"qwen2", label:"qwen2 (advanced)", tier:"advanced" as ModelTier },
-  { value:"llama3.1", label:"llama3.1 (advanced)", tier:"advanced" as ModelTier },
-];
 
 // ============================================================
 // PROMPT BUILDER
 // ============================================================
 
-function buildPrompt(profiles: ColumnProfile[], causalChains: CausalRelation[], memory: InteractionMemory | undefined, level: PromptLevel, modelTier: ModelTier): string {
-  emit({ stage:"PROMPT_BUILD", level:"info", message:`Building prompt at level=${level}, tier=${modelTier}` });
-  const MAX_PROFILES = level==="full"?15:level==="compressed"?8:4;
-  const MAX_CHAINS = level==="full"?12:level==="compressed"?5:2;
-  const MAX_WORKFLOWS = modelTier==="standard"?3:5;
-  const slimProfiles = profiles.slice(0,MAX_PROFILES).map(p=>({ 
-    column:p.cleanName, 
-    role:p.role, 
-    avg:p.avg, 
-    min:p.min,
-    max:p.max,
-    drift:p.temporalDrift, 
-    outliers:p.outlierCount,
-    entropy:p.entropy,
-    regimeShift:p.regimeShiftDetected,
-    clusters:p.topClusters?.slice(0,2),
-    rawValuesSlice:p.rawValues.slice(0,12)
-  }));
-  const slimChains = causalChains.slice(0,MAX_CHAINS);
-  
-  const uiSchemaExample = `{ "type": "col", "children": [{"type": "row", "children": [{"type": "kpi_block"}, {"type": "trend_sparkline"}]}, {"type": "stat_grid"}] }`;
-  
-  let reinforcementContext = "";
-  if (memory && level==="full" && (memory.approvedTags.length>0||memory.rejectedTags.length>0)) {
-    reinforcementContext = `\nUSER REINFORCEMENT: approved=[${memory.approvedTags.join(", ")}] rejected=[${memory.rejectedTags.join(", ")}] preferredDensity=${memory.preferredDensity}`;
-  }
-
-  if (level==="minimal") {
-    return `You are a data analysis AI. Output ONLY valid JSON, no markdown wrappers, no explanation.\n\nDATASET: ${JSON.stringify(slimProfiles)}\n\nOUTPUT:\n{"agenticState":{"situationalAwareness":"string","layoutStrategy":"string","cognitiveDensity":"high","selfCritique":"string"},"dashboard":{"globalSummary":"string","globalSeverity":"stable","dashboardLayoutMode":"INTELLIGENCE_GRID","heroInsight":{"headline":"string","supportingStatement":"string","primaryMetricValue":"string","metricLabel":"string","causalLink":"string","affectedVectors":["col"],"severity":"low"},"workflows":[{"title":"string","layoutMode":"dashboard","archetype":"OPERATIONAL_WORKFLOW","uiBlueprint":${uiSchemaExample},"primaryMetric":"string","secondaryMetric":"string","severity":"medium","quickStats":{"Key":"Val"},"tags":["Tag"],"confidence":80,"description":"string","reasoning":"string","businessContext":"string","detectedColumns":["col"],"chartData":[10,20,30]}]}}`;
-  }
-
-  return `You are a production-grade autonomous intelligence engine compiling high-density layouts over mathematical structures.
-Output ONLY strict JSON. No explanation text, no markdown wrappers.
-
-DATASET STATISTICAL METADATA:
-${JSON.stringify(slimProfiles,null,1)}
-
-MUTUAL COVARIANCE AND CAUSAL RELATIONS:
-${JSON.stringify(slimChains,null,1)}
-${reinforcementContext}
-
-TASK:
-1. Synthesize exactly ONE dominant "heroInsight" capturing the primary structural state. Combine different factors (e.g. "Column X shifted while Column Y reacted").
-2. Choose "dashboardLayoutMode" from:
-   - "COMPACT" (for small files/attributes < 4)
-   - "TIMELINE_FIRST" (if temporalDrift is highly active across profiles)
-   - "GRAPH_FIRST" (if high correlation Pearson R nodes are present)
-   - "INTELLIGENCE_GRID" (standard density layout)
-3. Generate exactly ${MAX_WORKFLOWS} highly integrated analytical workflows. Each must match one of the following archetypes exactly:
-   - "ANOMALY_WORKFLOW", "TEMPORAL_WORKFLOW", "CORRELATION_WORKFLOW", "DISTRIBUTION_WORKFLOW", "CLUSTER_WORKFLOW", "BEHAVIORAL_WORKFLOW", "OPERATIONAL_WORKFLOW"
-
-STRICT RULES:
-- "chartData" must map directly to one of the "rawValuesSlice" arrays in the dataset. DO NOT FABRICATE RANDOM CHART ARRAYS.
-- If there are active Causal Relations, narrate them together in the description. Example: "Variability in Sleep Hours correlates with elevated Stress values."
-- "quickStats" must contain keys mapping to exact statistical descriptors (e.g., Entropy, Volatility, Max, StdDev).
-
-STRICT OUTPUT JSON TEMPLATE:
-{
-  "agenticState": {
-    "situationalAwareness": "Analysis of active telemetry chains.",
-    "layoutStrategy": "Density prioritized dashboard layout mode assignment.",
-    "cognitiveDensity": "high",
-    "selfCritique": "Pearson R matrices verified to prevent spurious correlations."
-  },
-  "dashboard": {
-    "globalSummary": "A concise systemic summary mapping active vectors.",
-    "globalSeverity": "critical" | "elevated" | "stable",
-    "dashboardLayoutMode": "COMPACT" | "INTELLIGENCE_GRID" | "TIMELINE_FIRST" | "GRAPH_FIRST",
-    "heroInsight": {
-      "headline": "Causal narrative summarizing correlated shifts (e.g., 'Volatily spiked 18% during high entropy intervals')",
-      "supportingStatement": "Detailed operational narrative stating variables and calculated shifts.",
-      "primaryMetricValue": "Direct metric representation (e.g., 22.4% or +14ms)",
-      "metricLabel": "Description of metric parameter",
-      "causalLink": "Primary covariance link statement between variables",
-      "affectedVectors": ["List of Cleaned Column Names affected"],
-      "severity": "critical" | "high" | "medium" | "low"
-    },
-    "workflows": [
-      {
-        "title": "Clear, grounded title reflecting processed columns",
-        "layoutMode": "dashboard" | "comparison" | "alert",
-        "archetype": "ANOMALY_WORKFLOW" | "TEMPORAL_WORKFLOW" | "CORRELATION_WORKFLOW" | "DISTRIBUTION_WORKFLOW" | "CLUSTER_WORKFLOW" | "BEHAVIORAL_WORKFLOW" | "OPERATIONAL_WORKFLOW",
-        "uiBlueprint": {
-          "type": "col" | "row" | "grid_2",
-          "children": [
-            { "type": "kpi_block" },
-            { "type": "trend_sparkline" }
-          ]
-        },
-        "primaryMetric": "Formatted real value (e.g. 14.5% or $12,430)",
-        "secondaryMetric": "Operational description of metric bounds",
-        "severity": "critical" | "high" | "medium" | "low",
-        "quickStats": { "StatKey1": "StatVal1" },
-        "tags": ["Telemetry"],
-        "confidence": 92,
-        "description": "Specific analytical insight grounded in raw data properties.",
-        "reasoning": "Mathematical analysis explanation referencing computed values.",
-        "businessContext": "Actionable downstream business context.",
-        "detectedColumns": ["Cleaned Column Name"],
-        "chartData": [10.2, 11.5, 9.8] 
-      }
-    ]
-  }
-}`;
-}
 
 // ============================================================
 // JSON EXTRACTION + REPAIR
 // ============================================================
 
-function repairTruncatedJSON(text: string): string | null {
-  const stack: string[] = [];
-  let inString=false, escape=false;
-  for (let i=0;i<text.length;i++) {
-    const ch=text[i];
-    if(escape){escape=false;continue;}
-    if(ch==="\\"&&inString){escape=true;continue;}
-    if(ch==='"'){inString=!inString;continue;}
-    if(inString) continue;
-    if(ch==="{"||ch==="[") stack.push(ch);
-    else if(ch==="}"||ch==="]") { if(stack.length===0) return null; stack.pop(); }
-  }
-  if(stack.length===0) return null;
-  let closing = inString?'"':"";
-  for(let i=stack.length-1;i>=0;i--) closing+=stack[i]==="{"?"}":"]";
-  return text+closing;
-}
-
-function extractAndRepairJSON(rawText: string): string | null {
-  emit({ stage:"JSON_EXTRACT", level:"info", message:"Starting extraction", data:rawText.slice(0,200) });
-  let text = rawText.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
-  try { JSON.parse(text); emit({ stage:"JSON_EXTRACT", level:"success", message:"Direct parse succeeded" }); return text; } catch {}
-  const startIndex=text.indexOf("{"), endIndex=text.lastIndexOf("}");
-  if(startIndex===-1||endIndex===-1) { emit({ stage:"JSON_EXTRACT", level:"error", message:"No JSON object found" }); return null; }
-  const candidate = text.substring(startIndex,endIndex+1);
-  try { JSON.parse(candidate); emit({ stage:"JSON_EXTRACT", level:"success", message:"Substring extraction succeeded" }); return candidate; } catch {}
-  const repaired = repairTruncatedJSON(candidate);
-  if(repaired) { try { JSON.parse(repaired); emit({ stage:"JSON_EXTRACT", level:"success", message:"Bracket repair succeeded" }); return repaired; } catch {} }
-  const sanitized = candidate.replace(/[\x00-\x1F\x7F]/g," ").replace(/\\(?!["\\/bfnrtu])/g,"\\\\").replace(/,\s*([}\]])/g,"$1").replace(/([{,]\s*)(\w+)\s*:/g,'$1"$2":');
-  try { JSON.parse(sanitized); emit({ stage:"JSON_EXTRACT", level:"success", message:"Sanitization repair succeeded" }); return sanitized; } catch(e) { emit({ stage:"JSON_EXTRACT", level:"error", message:"All repair strategies failed", data:e }); return null; }
-}
 
 // ============================================================
 // ZOD VALIDATION + NORMALIZATION
 // ============================================================
 
-function sanitizeUINode(node: unknown, depth=0): UINode {
-  const VALID_TYPES = new Set(["col","row","grid_2","kpi_block","scatter_plot","trend_sparkline","alert_chip","bar_chart","stat_grid","semantic_tags","data_table","insight_cluster"]);
-  if(!node||typeof node!=="object") return { type:"kpi_block" };
-  const n = node as Record<string,unknown>;
-  const type = String(n.type||"kpi_block");
-  const safeType = VALID_TYPES.has(type)?(type as UINode["type"]):"kpi_block";
-  const sanitized: UINode = { type:safeType, ...(n.meta&&typeof n.meta==="object"?{meta:n.meta as Record<string,unknown>}:{}) };
-  const isLayout = ["col","row","grid_2"].includes(safeType);
-  if(isLayout&&depth<4&&Array.isArray(n.children)&&n.children.length>0) sanitized.children=(n.children as unknown[]).slice(0,8).map(child=>sanitizeUINode(child,depth+1));
-  return sanitized;
-}
 
-function normalizeWorkflow(wf: z.infer<typeof ZWorkflow>): Workflow {
-  return { 
-    title:wf.title||"Operational Workflow", 
-    layoutMode:wf.layoutMode||"dashboard", 
-    archetype: (wf.archetype || "OPERATIONAL_WORKFLOW") as WorkflowArchetype,
-    uiBlueprint:sanitizeUINode(wf.uiBlueprint), 
-    primaryMetric:wf.primaryMetric||"—", 
-    secondaryMetric:wf.secondaryMetric||"—", 
-    severity:wf.severity||"medium", 
-    quickStats:wf.quickStats&&Object.keys(wf.quickStats).length>0?wf.quickStats:{}, 
-    tags:wf.tags?.length>0?wf.tags:["Insights"], 
-    confidence:wf.confidence??85, 
-    description:wf.description||"Operational analysis.", 
-    reasoning:wf.reasoning||"Statistical profiling applied.", 
-    businessContext:wf.businessContext||"Monitoring within operational bounds.", 
-    chartData:wf.chartData?.length>0?wf.chartData:[], 
-    detectedColumns:wf.detectedColumns||[] 
-  };
-}
 
-function salvagePartialDashboard(parsed: unknown): GlobalDashboard | null {
-  emit({ stage:"ZOD_VALIDATE", level:"warn", message:"Attempting partial dashboard salvage" });
-  try {
-    const obj = parsed as Record<string,unknown>;
-    const rawWorkflows: unknown[] = (obj?.dashboard as Record<string,unknown>)?.workflows as unknown[] || (obj?.workflows as unknown[]) || [];
-    const validWorkflows: Workflow[] = [];
-    for(const wf of rawWorkflows) { const r=ZWorkflow.safeParse(wf); if(r.success) validWorkflows.push(normalizeWorkflow(r.data)); }
-    if(validWorkflows.length===0) return null;
-    const agenticResult = ZAgenticState.safeParse(obj?.agenticState??{});
-    const agenticState = agenticResult.success ? agenticResult.data : { situationalAwareness:"Partial synthesis recovered.", layoutStrategy:"Deterministic layout applied.", cognitiveDensity:"high" as const, selfCritique:"Some workflows were recovered from a partial response." };
-    const rawHero = (obj?.dashboard as Record<string,unknown>)?.heroInsight;
-    const heroInsight = ZHeroInsight.safeParse(rawHero).success ? ZHeroInsight.parse(rawHero) : { headline: "Partial Recovery Core Stable", supportingStatement: "Recovered from parsed schema fragments.", primaryMetricValue: "100%", metricLabel: "Grounded Telemetry", causalLink: "Baseline recovery complete.", affectedVectors: [], severity: "low" as const };
-    emit({ stage:"ZOD_VALIDATE", level:"success", message:`Partial salvage: ${validWorkflows.length} workflows recovered` });
-    return { 
-      agenticState, 
-      globalSummary:String((obj?.dashboard as Record<string,unknown>)?.globalSummary??"Partial synthesis active."), 
-      globalSeverity:(["critical","elevated","stable"].includes(String((obj?.dashboard as Record<string,unknown>)?.globalSeverity))?(obj?.dashboard as Record<string,unknown>)?.globalSeverity:"stable") as "critical"|"elevated"|"stable", 
-      dashboardLayoutMode: "INTELLIGENCE_GRID",
-      heroInsight,
-      workflows:validWorkflows 
-    };
-  } catch { return null; }
-}
 
-function validateAndNormalize(rawJSON: string): GlobalDashboard | null {
-  let parsed: unknown;
-  try { parsed=JSON.parse(rawJSON); } catch(e) { emit({ stage:"ZOD_VALIDATE", level:"error", message:"JSON.parse failed", data:e }); return null; }
-  const payloadResult = ZLLMPayload.safeParse(parsed);
-  if(!payloadResult.success) { emit({ stage:"ZOD_VALIDATE", level:"warn", message:"Top-level validation failed", data:payloadResult.error.flatten() }); return salvagePartialDashboard(parsed); }
-  const { agenticState, dashboard } = payloadResult.data;
-  const validWorkflows: Workflow[] = [];
-  const raw = dashboard.workflows as unknown[];
-  for(let i=0;i<raw.length;i++) {
-    const wfResult = ZWorkflow.safeParse(raw[i]);
-    if(wfResult.success) validWorkflows.push(normalizeWorkflow(wfResult.data));
-    else emit({ stage:"ZOD_VALIDATE", level:"warn", message:`Workflow[${i}] invalid — discarding`, data:wfResult.error.flatten() });
-  }
-  if(validWorkflows.length===0) { emit({ stage:"ZOD_VALIDATE", level:"error", message:"No valid workflows survived validation" }); return null; }
-  emit({ stage:"ZOD_VALIDATE", level:"success", message:`Validation passed: ${validWorkflows.length}/${raw.length} workflows preserved` });
-  return { 
-    agenticState:agenticState as AgenticState, 
-    globalSummary:dashboard.globalSummary, 
-    globalSeverity:dashboard.globalSeverity, 
-    dashboardLayoutMode: dashboard.dashboardLayoutMode,
-    heroInsight: dashboard.heroInsight,
-    workflows:validWorkflows 
-  };
-}
 
 // ============================================================
 // LLM STREAMING CALL
 // ============================================================
 
-async function singleLLMAttempt(prompt: string, model: string, timeoutMs: number, onProgress?: (tokens: number) => void): Promise<LLMAttemptResult> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => { controller.abort(); emit({ stage:"LLM_CALL", level:"warn", message:`Timeout after ${timeoutMs/1000}s` }); }, timeoutMs);
-  try {
-    const response = await fetch(LLM_CONFIG.endpoint, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ model, prompt, stream:true }), signal:controller.signal });
-    clearTimeout(timeoutId);
-    if(!response.ok) { emit({ stage:"LLM_CALL", level:"error", message:`HTTP ${response.status} — is Ollama running?` }); return { success:false, failureReason:"api_unreachable" }; }
-    const reader = response.body?.getReader();
-    if(!reader) return { success:false, failureReason:"unknown" };
-    const decoder = new TextDecoder();
-    let rawResponse="", tokenCount=0;
-    while(true) {
-      const { done, value } = await reader.read();
-      if(done) break;
-      const chunk = decoder.decode(value,{stream:true});
-      for(const line of chunk.split("\n")) {
-        if(!line.trim()) continue;
-        try { const parsed=JSON.parse(line); if(parsed.response){rawResponse+=parsed.response;tokenCount++;onProgress?.(tokenCount);} if(parsed.done) break; } catch {}
-      }
-    }
-    emit({ stage:"LLM_CALL", level:"success", message:`Stream complete — ${tokenCount} tokens`, data:rawResponse.slice(0,400) });
-    const extracted = extractAndRepairJSON(rawResponse);
-    if(!extracted) return { success:false, failureReason:"malformed_json", rawResponse };
-    const dashboard = validateAndNormalize(extracted);
-    if(!dashboard) return { success:false, failureReason:"schema_validation_failed", rawResponse };
-    if(dashboard.workflows.length===0) return { success:false, failureReason:"empty_workflows", rawResponse };
-    return { success:true, dashboard };
-  } catch(error: unknown) {
-    clearTimeout(timeoutId);
-    const isAbort = error instanceof Error && error.name==="AbortError";
-    const isNetwork = error instanceof TypeError && error.message.includes("fetch");
-    emit({ stage:"LLM_CALL", level:"error", message:isAbort?`Aborted after ${timeoutMs/1000}s`:isNetwork?"Network error — Ollama unreachable":"Unknown error", data:error });
-    return { success:false, failureReason:isAbort?"timeout":"api_unreachable" };
-  }
-}
+
 
 // ============================================================
 // RETRY ORCHESTRATOR
 // ============================================================
 
-async function generateAgenticDashboard(profiles: ColumnProfile[], causalChains: CausalRelation[], memory?: InteractionMemory, model: string = LLM_CONFIG.defaultModel, onProgress?: (attempt:number, tokens:number)=>void): Promise<{dashboard:GlobalDashboard|null; source:"llm"|"fallback"; reason?:LLMFailureReason}> {
-  const modelTier = getModelTier(model);
-  const levels: PromptLevel[] = ["full","compressed","minimal"];
-  const timeouts = [LLM_CONFIG.timeouts.full, LLM_CONFIG.timeouts.compressed, LLM_CONFIG.timeouts.minimal];
-  let lastFailureReason: LLMFailureReason = "unknown";
-  for(let attempt=0;attempt<3;attempt++) {
-    const level = levels[attempt];
-    emit({ stage:"RETRY", level:"info", message:`Attempt ${attempt+1}/3 — level=${level}, timeout=${timeouts[attempt]/1000}s` });
-    const prompt = buildPrompt(profiles,causalChains,memory,level,modelTier);
-    const result = await singleLLMAttempt(prompt,model,timeouts[attempt],(tokens)=>onProgress?.(attempt+1,tokens));
-    if(result.success&&result.dashboard) { emit({ stage:"RETRY", level:"success", message:`Succeeded on attempt ${attempt+1}` }); return { dashboard:result.dashboard, source:"llm" }; }
-    lastFailureReason = result.failureReason??"unknown";
-    if(lastFailureReason==="api_unreachable") { emit({ stage:"RETRY", level:"warn", message:"API unreachable — skipping retries" }); break; }
-    emit({ stage:"RETRY", level:"warn", message:`Attempt ${attempt+1} failed: ${lastFailureReason}` });
-  }
-  emit({ stage:"FALLBACK", level:"warn", message:`Fallback triggered. Reason: ${lastFailureReason}` });
-  return { dashboard:null, source:"fallback", reason:lastFailureReason };
-}
+
 
 // ============================================================
 // FALLBACK GENERATOR
 // ============================================================
 
-const FALLBACK_REASON_LABELS: Record<LLMFailureReason,string> = {
-  api_unreachable:"Ollama service unreachable — running deterministic synthesis",
-  timeout:"Generation exceeded time limit — running deterministic synthesis",
-  malformed_json:"Response parsing failed after 3 attempts — running deterministic synthesis",
-  schema_validation_failed:"Schema validation failed after 3 attempts — running deterministic synthesis",
-  empty_workflows:"No valid workflows generated — running deterministic synthesis",
-  unknown:"Running deterministic synthesis",
-};
 
-function generateFallbackDashboard(profiles: ColumnProfile[], causalChains: CausalRelation[], reason: LLMFailureReason = "unknown"): GlobalDashboard {
-  const workflows: Workflow[] = [];
-  const consumed = new Set<string>();
-  
-  // 1. ANOMALY_WORKFLOW
-  const anomalous = profiles.find(p=>p.outlierCount&&p.outlierCount>0&&!consumed.has(p.cleanName));
-  if(anomalous) { 
-    consumed.add(anomalous.cleanName); 
-    workflows.push({ 
-      title:`${anomalous.cleanName} Anomaly Limits`, 
-      layoutMode:"alert", 
-      archetype: "ANOMALY_WORKFLOW",
-      uiBlueprint:{type:"col",children:[{type:"alert_chip"},{type:"kpi_block"},{type:"stat_grid"},{type:"semantic_tags"}]}, 
-      primaryMetric:`${anomalous.outlierCount} Anomalies`, 
-      secondaryMetric:"Breaches statistical limit band", 
-      severity:"critical", 
-      quickStats:{Max:anomalous.max||"—",Avg:anomalous.avg||"—", StdDev: anomalous.stdDev||"—", Entropy: String(anomalous.entropy||"0")}, 
-      tags:["Anomaly","Risk Control"], 
-      confidence:96, 
-      description:`Calculated rolling state variance on raw telemetry vectors detected ${anomalous.outlierCount} records shifting outside threshold rules.`, 
-      reasoning:`Data vectors exceed 3 standard deviations limits of the computed distribution mean: ${anomalous.avg}.`, 
-      businessContext:"Anomalous shifts disrupt baseline operational flow. Real-time logging exceptions routing required.", 
-      detectedColumns:[anomalous.cleanName], 
-      chartData:anomalous.rawValues.length>0?anomalous.rawValues:[] 
-    }); 
-  }
-  
-  // 2. TEMPORAL_WORKFLOW
-  const drifting = profiles.find(p=>p.temporalDrift&&!consumed.has(p.cleanName));
-  if(drifting) { 
-    consumed.add(drifting.cleanName); 
-    workflows.push({ 
-      title:`${drifting.cleanName} Structural Drift`, 
-      layoutMode:"dashboard", 
-      archetype: "TEMPORAL_WORKFLOW",
-      uiBlueprint:{type:"col",children:[{type:"row",children:[{type:"kpi_block"},{type:"trend_sparkline"}]},{type:"stat_grid"}]}, 
-      primaryMetric:drifting.temporalDrift!, 
-      secondaryMetric:"Chronological sequence drift", 
-      severity:"high", 
-      quickStats:{Direction:drifting.temporalDrift!.includes("-")?"Negative Drift":"Positive Trend", Volatility: drifting.rollingVolatility?.length ? drifting.rollingVolatility[0].toString() : "0", Max:drifting.max||"—"}, 
-      tags:["Time-Series","Drift"], 
-      confidence:92, 
-      description:`Deterministic splitting indicates sequential drift of ${drifting.temporalDrift} across data lifespan.`, 
-      reasoning:`Univariate temporal validation confirmed steady divergence from primary initial mean parameters.`, 
-      businessContext:"Unmanaged directional shift indicates macro system fatigue or loss of telemetry calibration.", 
-      detectedColumns:[drifting.cleanName], 
-      chartData:drifting.rawValues.length>0?drifting.rawValues:[] 
-    }); 
-  }
-  
-  // 3. CORRELATION_WORKFLOW
-  const topRel = causalChains[0];
-  if(topRel) { 
-    consumed.add(topRel.source);consumed.add(topRel.target); 
-    workflows.push({ 
-      title:`${topRel.source} / ${topRel.target} Linkage`, 
-      layoutMode:"comparison", 
-      archetype: "CORRELATION_WORKFLOW",
-      uiBlueprint:{type:"grid_2",children:[{type:"col",children:[{type:"kpi_block"},{type:"stat_grid"}]},{type:"scatter_plot"}]}, 
-      primaryMetric:`R: ${topRel.pearsonR}`, 
-      secondaryMetric:"Linear Pearson Correlation Strength", 
-      severity:"high", 
-      quickStats:{Covariance: String(topRel.covariance), Relation:topRel.direction.replace(/_/g," ")}, 
-      tags:["Correlation","Causal Mapping"], 
-      confidence:89, 
-      description:`Calculated covariance indicates strong association metrics between ${topRel.source} and ${topRel.target}.`, 
-      reasoning:`Co-variance modeling supports active feedback dynamics with non-spurious statistical confidence.`, 
-      businessContext:"Causal coupling lets operators control down-stream variables by manipulating primary inputs.", 
-      detectedColumns:[topRel.source,topRel.target], 
-      chartData:profiles.find(p=>p.cleanName===topRel.source)?.rawValues||[] 
-    }); 
-  }
 
-  // Baseline Operation Fallback
-  if(workflows.length===0&&profiles.length>0) { 
-    const base=profiles[0]; 
-    workflows.push({ 
-      title:`${base.cleanName} Operations Standard`, 
-      layoutMode:"dashboard", 
-      archetype: "OPERATIONAL_WORKFLOW",
-      uiBlueprint:{type:"col",children:[{type:"kpi_block"},{type:"bar_chart"},{type:"stat_grid"}]}, 
-      primaryMetric:base.avg ? `Mean: ${base.avg}` : `H: ${base.uniquePercent}%`, 
-      secondaryMetric:"Stable configuration variables", 
-      severity:"low", 
-      quickStats:{Avg:base.avg||"—", Min:base.min||"—", Nulls:`${base.nullPercent}%`}, 
-      tags:["Operations","Baseline"], 
-      confidence:80, 
-      description:`Baseline profiling verifies standard variables matching active target bounds.`, 
-      reasoning:`Univariate analytics confirm current values stay inside expected statistical parameters.`, 
-      businessContext:"Passive profiling prevents unexpected systemic regressions down the line.", 
-      detectedColumns:[base.cleanName], 
-      chartData:base.rawValues 
-    }); 
-  }
 
-  const hasCritical = workflows.some(w=>w.severity==="critical");
-  const hasHigh = workflows.some(w=>w.severity==="high");
-
-  let fallbackLayoutMode: GlobalDashboard["dashboardLayoutMode"] = "INTELLIGENCE_GRID";
-  if (profiles.length < 4) fallbackLayoutMode = "COMPACT";
-  else if (drifting) fallbackLayoutMode = "TIMELINE_FIRST";
-  else if (topRel) fallbackLayoutMode = "GRAPH_FIRST";
-
-  const heroInsight: HeroInsight = {
-    headline: topRel 
-      ? `State variables ${topRel.source} and ${topRel.target} show strong dynamic coupling`
-      : "Core operational state parameters remain balanced",
-    supportingStatement: topRel 
-      ? `A linear Pearson relation of ${topRel.pearsonR} is active, while information entropy stands at ${topRel.entropyGap}.`
-      : "Baseline analytics confirm all variables stay within standard operating bounds.",
-    primaryMetricValue: topRel ? `${topRel.pearsonR}` : "100%",
-    metricLabel: topRel ? "Pearson R Strength" : "State Entropy",
-    causalLink: topRel ? `${topRel.source} drives variance shifts in ${topRel.target}.` : "All variables uncoupled.",
-    affectedVectors: topRel ? [topRel.source, topRel.target] : [],
-    severity: hasCritical ? "critical" : hasHigh ? "high" : "low"
-  };
-  
-  return { 
-    agenticState:{ 
-      situationalAwareness:`Deterministic fallback engine running. ${FALLBACK_REASON_LABELS[reason]}.`, 
-      layoutStrategy:"Adaptive composition matrices assigned via dataset metadata variables.", 
-      cognitiveDensity:"high", 
-      selfCritique:"Parsed validation complete. Uncorrelated data layers pruned." 
-    }, 
-    globalSummary: hasCritical ? "Statistical anomalies detected inside telemetry chains." : "Operations running inside steady state configurations.", 
-    globalSeverity: hasCritical ? "critical" : hasHigh ? "elevated" : "stable", 
-    dashboardLayoutMode: fallbackLayoutMode,
-    heroInsight,
-    workflows: workflows.sort((a,b)=>({critical:4,high:3,medium:2,low:1}[b.severity]-{critical:4,high:3,medium:2,low:1}[a.severity])) 
-  };
-}
 
 // ============================================================
 // ANIMATED BACKGROUND PARTICLES
 // ============================================================
 
-function ParticleField() {
-  const particles = Array.from({ length: 24 }, (_, i) => ({
-    id: i,
-    x: Math.random() * 100,
-    y: Math.random() * 100,
-    size: Math.random() * 1.5 + 0.5,
-    duration: Math.random() * 20 + 15,
-    delay: Math.random() * -20,
-  }));
-  return (
-    <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
-      {particles.map(p => (
-        <motion.div
-          key={p.id}
-          className="absolute rounded-full bg-blue-500/[0.03]"
-          style={{ left: `${p.x}%`, top: `${p.y}%`, width: p.size, height: p.size }}
-          animate={{ y: [0, -80, 0], opacity: [0, 0.3, 0], scale: [0, 1, 0] }}
-          transition={{ duration: p.duration, delay: p.delay, repeat: Infinity, ease: "easeInOut" }}
-        />
-      ))}
-      <div className="absolute top-1/4 left-1/4 w-96 h-96 rounded-full bg-blue-600/[0.01] blur-3xl pointer-events-none" />
-      <div className="absolute bottom-1/4 right-1/4 w-80 h-80 rounded-full bg-violet-600/[0.01] blur-3xl pointer-events-none" />
-    </div>
-  );
-}
+
 
 // ============================================================
 // ANIMATED LOGO
 // ============================================================
 
 const letters = "MorphUI".split("");
-function MorphLogo() {
-  return (
-    <div className="flex justify-center items-center gap-0.5">
-      {letters.map((letter, index) => (
-        <motion.span
-          key={index}
-          animate={{ y:[0,-2,1,0], scaleY:[1,1.1,0.97,1], scaleX:[1,0.95,1.03,1], color:["#ffffff","#60a5fa","#a78bfa","#ffffff"] }}
-          transition={{ duration:4+index*0.12, repeat:Infinity, ease:"easeInOut", delay:index*0.06 }}
-          className="text-4xl inline-block font-extrabold tracking-tighter select-none"
-        >
-          {letter}
-        </motion.span>
-      ))}
-    </div>
-  );
-}
+
 
 // ============================================================
 // SCAN LINE LOADING ANIMATION
@@ -923,170 +243,19 @@ function ScanLine() {
 // STREAM PROGRESS BAR
 // ============================================================
 
-function StreamProgressBar({ tokens, attempt, maxTokens = 800 }: { tokens: number; attempt: number; maxTokens?: number }) {
-  const progress = Math.min((tokens / maxTokens) * 100, 94);
-  const springProgress = useSpring(useMotionValue(0), { stiffness: 60, damping: 20 });
 
-  useEffect(() => {
-    springProgress.set(progress);
-  }, [progress, springProgress]);
-
-  return (
-    <div className="space-y-2.5 w-full max-w-xs mx-auto">
-      <div className="flex items-center justify-between text-[10px] font-mono">
-        <span className="text-blue-500">STAGE {attempt}/3 · STREAMING ANALYTICAL PLANS</span>
-        <motion.span key={tokens} initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-zinc-500 tabular-nums">
-          {tokens.toLocaleString()} tkn
-        </motion.span>
-      </div>
-      <div className="w-full bg-zinc-950 border border-zinc-900 rounded-full h-[3px] overflow-hidden">
-        <motion.div
-          className="h-full rounded-full bg-gradient-to-r from-blue-500 via-indigo-500 to-violet-500"
-          style={{ width: `${progress}%` }}
-        />
-      </div>
-    </div>
-  );
-}
 
 // ============================================================
 // SEVERITY SYSTEM
 // ============================================================
 
-const severityColors: Record<Severity, string> = {
-  critical: "text-rose-400 border-rose-500/20 bg-rose-500/[0.03]",
-  high: "text-orange-400 border-orange-500/20 bg-orange-500/[0.03]",
-  medium: "text-amber-400 border-amber-500/20 bg-amber-500/[0.03]",
-  low: "text-blue-400 border-blue-500/20 bg-blue-500/[0.03]",
-};
+
 
 // ============================================================
 // RECURSIVE UI RENDERER
 // ============================================================
 
-function UIRecursiveRenderer({ node, workflow, maxVal, density }: { node: UINode; workflow: Workflow; maxVal: number; density: "high"|"medium"|"low" }) {
-  const gapClass = density==="high"?"gap-1.5":density==="low"?"gap-4":"gap-2.5";
-  if(node.type==="col") return <div className={`flex flex-col ${gapClass} w-full`}>{node.children?.map((c,i)=><UIRecursiveRenderer key={i} node={c} workflow={workflow} maxVal={maxVal} density={density}/>)}</div>;
-  if(node.type==="row") return <div className={`flex flex-row ${gapClass} w-full items-stretch`}>{node.children?.map((c,i)=><UIRecursiveRenderer key={i} node={c} workflow={workflow} maxVal={maxVal} density={density}/>)}</div>;
-  if(node.type==="grid_2") return <div className={`grid grid-cols-2 ${gapClass} w-full`}>{node.children?.map((c,i)=><UIRecursiveRenderer key={i} node={c} workflow={workflow} maxVal={maxVal} density={density}/>)}</div>;
 
-  const realChartData = workflow.chartData || [];
-
-  switch(node.type) {
-    case "alert_chip":
-      return (
-        <div className={`border px-2 py-0.5 rounded flex items-center gap-1.5 w-fit select-none font-mono text-[8px] uppercase tracking-wider ${severityColors[workflow.severity]}`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${workflow.severity==="critical"?"bg-rose-500 animate-pulse" : "bg-current"}`}/>
-          {workflow.severity} Priority State
-        </div>
-      );
-    case "kpi_block": {
-      if (workflow.primaryMetric === "—") return null; 
-      return (
-        <motion.div initial={{opacity:0}} animate={{opacity:1}} className={`bg-zinc-950/80 border border-zinc-900/60 rounded-lg flex flex-col justify-center flex-1 min-w-[100px] ${density==="high"?"p-2.5":"p-4"} backdrop-blur-md`}>
-          <motion.p initial={{opacity:0,y:-4}} animate={{opacity:1,y:0}} className={`${density==="high"?"text-lg":"text-xl"} font-extrabold text-white tracking-tight truncate`}>{workflow.primaryMetric}</motion.p>
-          <p className="text-zinc-600 text-[9px] tracking-tight mt-0.5 truncate">{workflow.secondaryMetric}</p>
-        </motion.div>
-      );
-    }
-    case "scatter_plot": {
-      if (realChartData.length < 3) return null; 
-      return (
-        <div className="bg-zinc-950 border border-zinc-900/60 p-2.5 rounded-lg h-14 relative overflow-hidden flex flex-col justify-end flex-1">
-          <div className="absolute inset-0 opacity-[0.02] bg-[radial-gradient(circle_at_center,_#3b82f6_1px,_transparent_1px)] [background-size:8px_8px]"/>
-          <div className="z-10 flex gap-1.5 w-full justify-between items-end h-full">
-            {realChartData.slice(0,10).map((d,i)=>(
-              <motion.div 
-                key={i} 
-                initial={{scale:0,opacity:0}} 
-                animate={{y:-(d/maxVal)*28,scale:1,opacity:1}} 
-                transition={{duration:0.4,delay:i*0.02}} 
-                className="w-1.5 h-1.5 rounded-full bg-blue-500/80 shrink-0"
-              />
-            ))}
-          </div>
-        </div>
-      );
-    }
-    case "trend_sparkline": {
-      if (realChartData.length < 3) return null; 
-      return (
-        <div className="bg-zinc-950 border border-zinc-900/60 p-2 rounded-lg h-14 relative flex items-end gap-[1px] flex-1 overflow-hidden">
-          {realChartData.map((val,i)=>(
-            <motion.div 
-              key={i} 
-              initial={{height:0}} 
-              animate={{height:`${(val/maxVal)*100}%`}} 
-              transition={{duration:0.4,delay:i*0.015}} 
-              className="flex-1 bg-gradient-to-t from-violet-600/40 to-violet-400/30 hover:from-violet-500/60 rounded-t-[1px] transition-colors"
-            />
-          ))}
-          <div className="absolute inset-0 bg-gradient-to-t from-zinc-950/20 to-transparent pointer-events-none"/>
-        </div>
-      );
-    }
-    case "bar_chart": {
-      if (realChartData.length < 3) return null; 
-      return (
-        <div className="bg-zinc-950 border border-zinc-900/60 p-2.5 rounded-lg flex flex-col justify-center gap-1.5 flex-1">
-          {realChartData.slice(0,4).map((val,i)=>(
-            <div key={i} className="space-y-0.5">
-              <div className="w-full bg-zinc-900 h-1 rounded-full overflow-hidden">
-                <motion.div initial={{width:0}} animate={{width:`${(val/maxVal)*100}%`}} className="bg-gradient-to-r from-emerald-600 to-emerald-400 h-full rounded-full"/>
-              </div>
-            </div>
-          ))}
-        </div>
-      );
-    }
-    case "stat_grid": {
-      if (!workflow.quickStats || Object.keys(workflow.quickStats).length === 0) return null; 
-      return (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-1.5 w-full">
-          {Object.entries(workflow.quickStats).map(([k,v])=>(
-            <div key={k} className="bg-zinc-950 border border-zinc-900/50 p-1.5 rounded" title={`${k}: ${v}`}>
-              <p className="text-zinc-600 text-[8px] uppercase tracking-wider mb-0.5 truncate">{k}</p>
-              <p className="text-zinc-300 font-bold text-[10px] truncate">{v}</p>
-            </div>
-          ))}
-        </div>
-      );
-    }
-    case "semantic_tags": {
-      if (workflow.detectedColumns.length === 0) return null; 
-      return (
-        <div className="flex gap-1 flex-wrap text-[8px] font-mono select-none">
-          {workflow.detectedColumns.slice(0,3).map(c=><span key={c} className="bg-zinc-900 text-zinc-500 border border-zinc-800 px-1 py-0.5 rounded">{c}</span>)}
-          {workflow.tags.slice(0,2).map(t=><span key={t} className="border border-zinc-900 text-zinc-600 px-1 py-0.5 rounded">{t}</span>)}
-        </div>
-      );
-    }
-    case "data_table": {
-      const headers=(node.meta?.headers as string[])||[], rows=(node.meta?.rows as string[][])||[];
-      if (headers.length === 0) return null;
-      return (
-        <div className="bg-zinc-950 border border-zinc-900 rounded-lg overflow-hidden w-full text-[8px] font-mono">
-          <table className="w-full text-left">
-            <thead className="bg-zinc-900 border-b border-zinc-800">
-              <tr>{headers.map((h,i)=><th key={i} className="px-2 py-1 text-zinc-500 font-semibold">{h}</th>)}</tr>
-            </thead>
-            <tbody>
-              {rows.slice(0,3).map((r,i)=><tr key={i} className="border-b border-zinc-900/50 hover:bg-zinc-900/20">{r.map((c,j)=><td key={j} className="px-2 py-1 text-zinc-400">{c}</td>)}</tr>)}
-            </tbody>
-          </table>
-        </div>
-      );
-    }
-    case "insight_cluster":
-      return (
-        <div className="bg-zinc-950 border-l-2 border-blue-500/60 p-2 rounded-r-lg w-full text-[10px]">
-          <p className="text-blue-400 font-bold mb-0.5">{(node.meta?.title as string)||"Real Insight Vector"}</p>
-          <p className="text-zinc-500 leading-normal">{(node.meta?.body as string)||"Active covariance limits validated."}</p>
-        </div>
-      );
-    default: return null;
-  }
-}
 
 // ============================================================
 // SYNTHESIS BADGE
@@ -1109,22 +278,6 @@ function SynthesisBadge({ synthesisState }: { synthesisState: SynthesisState }) 
 // CURSOR GLOW
 // ============================================================
 
-function CursorGlow() {
-  const [pos, setPos] = useState({ x: -200, y: -200 });
-  useEffect(() => {
-    const handler = (e: MouseEvent) => setPos({ x: e.clientX, y: e.clientY });
-    window.addEventListener("mousemove", handler, { passive: true });
-    return () => window.removeEventListener("mousemove", handler);
-  }, []);
-  return (
-    <div className="fixed inset-0 pointer-events-none z-0">
-      <div
-        className="absolute w-72 h-72 rounded-full bg-blue-500/[0.015] blur-3xl transition-transform duration-700 ease-out"
-        style={{ transform: `translate(${pos.x - 144}px, ${pos.y - 144}px)` }}
-      />
-    </div>
-  );
-}
 
 // ============================================================
 // LOADING OVERLAY
@@ -1140,42 +293,7 @@ const LOADING_PHASES = [
   "Resolving autonomous layouts…"
 ];
 
-function LoadingPhases({ streamingTokens, streamingAttempt }: { streamingTokens: number; streamingAttempt: number }) {
-  const [phaseIndex, setPhaseIndex] = useState(0);
 
-  useEffect(() => {
-    if(streamingTokens > 0) return;
-    const interval = setInterval(() => setPhaseIndex(i => Math.min(i+1, LOADING_PHASES.length-1)), 600);
-    return () => clearInterval(interval);
-  }, [streamingTokens]);
-
-  return (
-    <div className="space-y-4 flex flex-col items-center">
-      <div className="relative w-12 h-12">
-        <svg className="w-12 h-12 -rotate-90" viewBox="0 0 64 64">
-          <circle cx="32" cy="32" r="28" fill="none" stroke="rgba(255,255,255,0.01)" strokeWidth="2.5"/>
-          <motion.circle
-            cx="32" cy="32" r="28" fill="none" stroke="rgba(59,130,246,0.6)" strokeWidth="2.5"
-            strokeLinecap="round" strokeDasharray="175.9"
-            animate={{ strokeDashoffset: [175.9, 0, 175.9] }}
-            transition={{ duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
-          />
-        </svg>
-      </div>
-      <AnimatePresence mode="wait">
-        {streamingTokens > 0 ? (
-          <motion.div key="streaming" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}} className="w-full">
-            <StreamProgressBar tokens={streamingTokens} attempt={streamingAttempt}/>
-          </motion.div>
-        ) : (
-          <motion.div key={phaseIndex} initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}} className="text-center">
-            <p className="text-blue-400 text-xs font-mono">{LOADING_PHASES[phaseIndex]}</p>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
 
 // ============================================================
 // COLUMN CHIP REVEAL
